@@ -5,12 +5,8 @@ const Web3 = require("web3");
 
 const constants = require("./constants.js");
 
-let web3;
-
-function setupWeb3(url, options) {
-    const provider = new Web3.providers.WebsocketProvider(url, options);
-    web3 = new Web3(provider);
-}
+const provider = new Web3.providers.WebsocketProvider(constants.URL, constants.WEB3_OPTIONS);
+const web3 = new Web3(provider);
 
 function getContractInstance(address, abiPath) {
     const abi = JSON.parse(fs.readFileSync(abiPath));
@@ -18,7 +14,6 @@ function getContractInstance(address, abiPath) {
 }
 
 async function getEventsInChunks(contract, eventName, fromBlock, toBlock) {
-    console.log(`Start processing blocks ${fromBlock}, ${toBlock}`);
     if (fromBlock > toBlock) {
         console.log('fromBlock is higher than toBlock')
         return [];
@@ -26,22 +21,32 @@ async function getEventsInChunks(contract, eventName, fromBlock, toBlock) {
     let chunkSize = constants.INITIAL_BLOCK_RANGE;
     let allEvents = [];
     let successfulChunks = 0;
+
+    console.log(`Start processing blocks ${fromBlock}, ${toBlock} with chunk size = ${chunkSize}`);
     for (let chunkStartBlock = fromBlock; chunkStartBlock <= toBlock; chunkStartBlock += (chunkSize + 1)) {
+        let chunkEndBlock;
+
         if (chunkStartBlock > toBlock) {
-            let lastStoredBlock = allEvents[allEvents.length - 1].blockNumber + 1;
-            chunkStartBlock = lastStoredBlock < toBlock ? lastStoredBlock : toBlock;
-            console.log(`chunkStartBlock is higher than toBlock, reducing it to ${lastStoredBlock}`);
+            let lastStoredBlock = allEvents[allEvents.length - 1].blockNumber;
+            if (lastStoredBlock >= toBlock) {
+                // Reached an end of initial interval
+                break;
+            } else {
+                chunkStartBlock = lastStoredBlock + 1;
+                chunkEndBlock = toBlock;
+            }
+            console.log(`chunkStartBlock is higher than toBlock, reducing it to ${lastStoredBlock + 1}`);
+        } else {
+            chunkEndBlock = chunkStartBlock + chunkSize;
+            chunkEndBlock = chunkEndBlock > toBlock ? toBlock : chunkEndBlock;
         }
-        let chunkEndBlock = chunkStartBlock + chunkSize;
-        if (chunkEndBlock > toBlock) {
-            chunkEndBlock = toBlock;
-            console.log(`chunkStartBlock is higher than toBlock, reducing it to ${toBlock}`);
-        }
+
         try {
             console.log(`Getting events chunk for blocks [${chunkStartBlock}, ${chunkEndBlock}]`)
             const eventsChunk = await contract.getPastEvents(eventName, {
                 fromBlock: chunkStartBlock,
-                toBlock: chunkEndBlock
+                toBlock: chunkEndBlock,
+                filter: { to: constants.ZERO_ADDRESS }
             });
 
             console.log(`Successuly got events for blocks [${chunkStartBlock}, ${chunkEndBlock}]`);
@@ -73,41 +78,36 @@ async function getEventsInChunks(contract, eventName, fromBlock, toBlock) {
 }
 
 (async () => {
-    setupWeb3(constants.URL, constants.WEB3_OPTIONS);
-
     const borrowOps = getContractInstance(
         constants.BORROW_OPS,
-        './assets/BorrowerOperations.json'
+        "./assets/BorrowerOperations.json"
     );
+
+    const lusd = getContractInstance(constants.LUSD_ADDR, "./assets/LUSD.json");
 
     const dater = new EthDater(
         web3 // Web3 object, required.
     );
 
-    const fromBlock = await dater.getDate(constants.FROM_DATE);
-    const toBlock = await dater.getDate(constants.TO_DATE);
+    const fromBlock = (await dater.getDate(constants.FROM_DATE)).block;
+    const toBlock = (await dater.getDate(constants.TO_DATE)).block;
 
-    const events = await getEventsInChunks(borrowOps, constants.EVENT, fromBlock.block, toBlock.block)
-    const closeEvents = events.filter(_event => _event.returnValues.operation == constants.CLOSE_OP);
-    const closeHashes = closeEvents.map(_event => _event.transactionHash)
-    const closeTxsPromises = closeHashes.map(_hash => web3.eth.getTransactionReceipt(_hash));
+    const PRECISION = 10 ** (await lusd.methods.decimals().call());
+    const MILL = 10 ** 6;
+    lusdSupplyBefore = (await lusd.methods.totalSupply().call({}, fromBlock)) / PRECISION / MILL;
+    lusdSupplyAfter = (await lusd.methods.totalSupply().call({}, toBlock)) / PRECISION / MILL;
 
-    for (let i = 0; i < closeTxsPromises.length; i += 10) {
-        const chunk = closeTxsPromises.slice(i, i + 10);
-        let closeTxs = await Promise.all(chunk);
+    const events = await getEventsInChunks(lusd, 'Transfer', fromBlock, toBlock);
+    let totalValue = 0;
+    events.forEach(_event => {
+        const sender = _event.returnValues.from;
+        const value = _event.returnValues.value / PRECISION;
+        totalValue += value;
+        console.log(`From = ${sender}, Value: ${value}, block: ${_event.blockNumber}, tx: ${_event.transactionHash}`);
+});
 
-        closeTxs.forEach(_tx => {
-            _tx.logs.forEach(_log => {
-                if (_log.topics[0] == constants.TRANSFER_TOPIC) {
-                    const value = Math.floor(parseInt(_log.data, 16) / 10 ** 18);
-                    if (value == 200) {
-                        return;
-                    }
-                    console.log(`From = ${_tx.from}, Value: ${value}, block: ${_tx.blockNumber}, tx: ${_tx.transactionHash}`);
-                }
-            })
-        });
-    }
+    console.log(`LUSD total supply. Before = ${lusdSupplyBefore} millions, after = ${lusdSupplyAfter} millions, diff = ${lusdSupplyBefore - lusdSupplyAfter} millions`)
+    console.log(`Total burned value = ${totalValue / MILL} millions LUSD`);
     web3.currentProvider.disconnect();
 })()
     .then()
